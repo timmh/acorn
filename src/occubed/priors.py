@@ -1,0 +1,7 @@
+import math
+
+import numpyro.distributions as dist
+
+DEFAULT_LOGIT_COEF_VARIANCE = 2.72
+DEFAULT_LOGIT_COEF_SCALE = math.sqrt(DEFAULT_LOGIT_COEF_VARIANCE)
+DEFAULT_LOGIT_COEF_PRIOR = dist.Normal(0, DEFAULT_LOGIT_COEF_SCALE)
