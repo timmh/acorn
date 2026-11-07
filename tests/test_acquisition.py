@@ -5,12 +5,18 @@ os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from occubed.run_reviews import (
     binary_entropy,
     select_reviewed_label_target_eig_samples,
     select_top_acquisition_samples,
     target_eig_scores_from_prob_positive_draws,
+    validate_review_batch,
+)
+from occubed.review_policies import (
+    calibrated_prob_positive_draws, reviewed_label_prob_positive_draws,
+    uncalibrated_prob_positive_draws,
 )
 
 

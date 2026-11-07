@@ -1,5 +1,7 @@
 # ACORN: Active Continuous-Score Occupancy Modeling
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/timmh/acorn/blob/main/example/CameraTrapExample.ipynb)
+
 ## Codebase structure
 Shared code and utilities are located in `src/occubed`, individual processing steps can be found in `scripts`, unit tests can be found in `tests`, and documentation can be found in `docs`.
 

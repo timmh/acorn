@@ -24,6 +24,7 @@ from occubed.paths import (
     PACKAGE_DIR,
 )
 from occubed.submit_sweep import default_species_by_dataset
+from occubed.experiment_config import MAIN_EXPERIMENT_IDS
 from occubed.summaries import iter_parameter_summary_arrays
 
 if "ipykernel" in sys.modules:
@@ -50,12 +51,7 @@ AGGREGATED_SMOOTHING_LONG_WINDOW = 10
 AGGREGATED_SMOOTHING_LONG_HORIZON_MIN_SPAN = 100
 AGGREGATED_SMOOTHING_LONG_ROUGHNESS_THRESHOLD = 0.20
 AGGREGATED_SMOOTHING_LONG_MAX_JUMP_THRESHOLD = 0.40
-AGREEMENT_TREND_WINDOW = int(
-    os.environ.get("OCCUBED_ANALYSIS_AGREEMENT_TREND_WINDOW", "7")
-)
-AGREEMENT_RAW_TRACE_ALPHA = 0.22
-AGREEMENT_RAW_TRACE_LINEWIDTH = PLOT_LINEWIDTH * 0.55
-AGREEMENT_TREND_LINEWIDTH = PLOT_LINEWIDTH * 1.35
+AGREEMENT_CURVE_LINEWIDTH = PLOT_LINEWIDTH * 1.35
 
 matplotlib.rcParams.update(
     {
@@ -803,7 +799,6 @@ def create_process_pool(max_workers: int) -> ProcessPoolExecutor | None:
         return None
 
 
-# TODO: remove?
 def maybe_smooth_aggregated_curve(
     review_counts: pd.Series | np.ndarray,
     values: pd.Series | np.ndarray,
@@ -1448,6 +1443,8 @@ def normalize_exported_results_frame(results_frame: pd.DataFrame) -> pd.DataFram
         ["target_label", "run__target_label", "dataset__target_label"],
     )
     frame["species_key"] = frame["dataset_kind"] + "::" + frame["species"]
+    if "seed" not in frame and "run__random_seed" in frame:
+        frame["seed"] = pd.to_numeric(frame["run__random_seed"])
     frame["selection_method"] = coalesce_text_columns(
         frame,
         ["experiment__selection_method"],
@@ -1663,13 +1660,14 @@ def load_sweep_inventory(
             not species_frame.empty
             and "oracle_psi_mean_values" in species_frame.columns
         ):
-            oracle_psi_by_species = species_frame.set_index("species_key")[
+            oracle_psi_by_species = species_frame.set_index("species_index")[
                 "oracle_psi_mean_values"
             ].to_dict()
-            trace_frame["oracle_psi_mean_values"] = trace_frame["species_key"].map(
+            trace_frame["oracle_psi_mean_values"] = trace_frame["species_index"].map(
                 oracle_psi_by_species
             )
 
+    species_frame = species_frame.drop_duplicates("species_key").reset_index(drop=True)
     return species_frame, experiment_frame, trace_frame
 
 
@@ -1882,7 +1880,7 @@ def all_agreement_candidate_experiment_ids(covariate_variant: str) -> list[str]:
         .dropna()
         .astype(str)
         .unique()
-        if experiment_id.strip()
+        if experiment_id.strip() and experiment_id.removesuffix("__null") in MAIN_EXPERIMENT_IDS
     )
 
 
@@ -2010,6 +2008,60 @@ def filtered_experiment_frame(
     return frame
 
 
+def review_budget_cap_curves(
+    frame: pd.DataFrame,
+    *,
+    metric_columns: list[str],
+    reviews_per_step_by_dataset: dict[str, int],
+    review_budgets_by_dataset: dict[str, int],
+) -> pd.DataFrame:
+    """Match review budgets, carrying final fits only after candidate exhaustion."""
+    if frame.empty:
+        return frame.copy()
+    identity = ["dataset_kind", "species_key", "experiment_id"]
+    if "seed" in frame.columns:
+        identity.append("seed")
+    required = set(identity + ["review_count", "n_reviewable"] + metric_columns)
+    if missing := required.difference(frame.columns):
+        raise ValueError(f"Missing review-budget columns: {sorted(missing)}")
+    metadata = [name for name in ("species", "selection_method", "model_family", "plot_label",
+                                  "covariate_variant", "n_reviewable") if name in frame.columns]
+    output = []
+    for dataset, dataset_frame in frame.groupby("dataset_kind", sort=False):
+        cadence = reviews_per_step_by_dataset[dataset]
+        budget = review_budgets_by_dataset[dataset]
+        if cadence <= 0 or int(cadence) != cadence or budget <= 0 or int(budget) != budget:
+            raise ValueError("Review cadence and budget must be positive integers")
+        grid = np.append(np.arange(0, budget, cadence, dtype=int), int(budget))
+        for key, group in dataset_frame.groupby(identity, sort=False):
+            counts = pd.to_numeric(group["review_count"], errors="coerce").to_numpy(dtype=float)
+            if not np.isfinite(counts).all() or not np.equal(counts, np.floor(counts)).all():
+                raise ValueError(f"Invalid review checkpoints: {key}")
+            if group["review_count"].duplicated().any():
+                raise ValueError(f"Duplicate review checkpoints: {key}")
+            if any(group[column].nunique(dropna=False) != 1 for column in metadata):
+                raise ValueError(f"Inconsistent trajectory metadata: {key}")
+            available = safe_float(group["n_reviewable"].iloc[0])
+            if not np.isfinite(available) or available <= 0 or int(available) != available:
+                raise ValueError(f"Invalid candidate count: {key}")
+            terminal = min(int(available), int(budget))
+            expected = np.append(np.arange(0, terminal, cadence, dtype=int), terminal)
+            if not np.array_equal(np.sort(counts), expected):
+                raise ValueError(f"Missing or unexpected fitted checkpoints: {key}")
+            if not np.isfinite(group[metric_columns].to_numpy(dtype=float)).all():
+                raise ValueError(f"Nonfinite trajectory metrics: {key}")
+            # Every interior grid point must be an actual fit; only exhausted tails repeat.
+            fitted_counts = np.minimum(grid, terminal)
+            matched = group.set_index("review_count").loc[
+                fitted_counts, [name for name in identity if name != "review_count"] + metadata + metric_columns
+            ].reset_index(drop=True)
+            matched["review_count"] = grid
+            matched["fitted_review_count"] = fitted_counts
+            matched["is_exhausted_carry_forward"] = grid > terminal
+            output.append(matched)
+    return pd.concat(output, ignore_index=True)
+
+
 def aggregate_summary_curves(
     frame: pd.DataFrame,
     *,
@@ -2061,6 +2113,34 @@ def aggregate_summary_curves(
     if not value_frames:
         return pd.DataFrame()
     return pd.concat(value_frames, ignore_index=True)
+
+
+def agreement_budget_curves(frame: pd.DataFrame) -> pd.DataFrame:
+    """Join metric blocks, match complete budget grids, then average seeds."""
+    if frame.empty:
+        return frame.copy()
+    metrics = [name for name, _ in AGREEMENT_CURVE_METRICS if name in frame and frame[name].notna().any()]
+    identity = ["dataset_kind", "species", "species_key", "experiment_id",
+                "selection_method", "model_family", "covariate_variant", "plot_label",
+                "n_reviewable", "review_count"]
+    if "seed" in frame:
+        identity.append("seed")
+    joined = frame.groupby(identity, as_index=False, dropna=False)[metrics].first()
+    budgets = joined.groupby("dataset_kind").review_count.max().astype(int).to_dict()
+    cadences = {"acoustic": 5, "iwildcam": 25}
+    if "reviews_per_step" in frame:
+        for dataset, group in frame.groupby("dataset_kind"):
+            values = group.reviews_per_step.dropna().unique()
+            if len(values) != 1:
+                raise ValueError("Each dataset must have one review cadence per sweep.")
+            cadences[dataset] = int(values[0])
+    curves = review_budget_cap_curves(
+        joined, metric_columns=metrics, reviews_per_step_by_dataset=cadences,
+        review_budgets_by_dataset=budgets)
+    if "seed" in curves:
+        keys = [key for key in identity if key != "seed"]
+        curves = curves.groupby(keys, as_index=False, dropna=False)[metrics].mean()
+    return curves
 
 
 def aggregate_shared_policy_model_family_curves(
@@ -2227,6 +2307,8 @@ def policy_summary_table(
     covariate_variant: str,
     review_count: int = 50,
 ) -> pd.DataFrame:
+    if aggregate_frame.empty:
+        return pd.DataFrame()
     experiment_ids = required_experiment_ids(covariate_variant)
     subset = aggregate_frame[
         (aggregate_frame["metric"] == "mean_oracle_distance")
@@ -3407,6 +3489,8 @@ def build_ecological_agreement_frames(
         "plot_label",
         "review_count",
     ]
+    if "seed" in subset:
+        base_columns.append("seed")
     coefficient_rows: list[dict[str, object]] = []
     site_rows: list[dict[str, object]] = []
     parsed_vector_cache: dict[str, np.ndarray | None] = {}
@@ -3420,6 +3504,7 @@ def build_ecological_agreement_frames(
     for _row_index, row in subset.iterrows():
         base_row = {column: row[column] for column in base_columns}
         base_row["n_reviewable"] = safe_float(row.get("dataset__n_reviewable"))
+        base_row["reviews_per_step"] = safe_float(row.get("run__n_reviews_per_step"))
         coefficient_rows.append(
             {
                 **base_row,
@@ -3676,14 +3761,16 @@ def agreement_threshold_summary(
     if subset.empty:
         return {"available": False}
 
-    hits = [
-        agreement_threshold_species_hit(
-            species_group,
-            metric_column=metric_column,
-            dataset_kind=dataset_kind,
-        )
-        for _species_key, species_group in subset.groupby("species_key", sort=True)
-    ]
+    hits = []
+    for _species_key, species_group in subset.groupby("species_key", sort=True):
+        seed_groups = (species_group.groupby("seed", sort=True) if "seed" in species_group
+                       else [(0, species_group)])
+        seed_hits = [agreement_threshold_species_hit(
+            group, metric_column=metric_column, dataset_kind=dataset_kind)
+            for _, group in seed_groups]
+        hits.append(dict(step=float(np.median([hit["step"] for hit in seed_hits])),
+                         fraction=float(np.median([hit["fraction"] for hit in seed_hits])),
+                         reached=np.mean([hit["reached"] for hit in seed_hits]) > .5))
     hits = [
         hit
         for hit in hits
@@ -4026,46 +4113,7 @@ def agreement_threshold_results_latex(
                 row_cells.append(str(row[AGREEMENT_THRESHOLD_SPEEDUP_COLUMN_LABEL]))
             tabular_lines.append(" & ".join(row_cells) + r" \\")
     tabular_lines.extend(["\\bottomrule", "\\end{tabular}"])
-    tabular = "\n".join(tabular_lines)
-    if AGREEMENT_THRESHOLD_RENDER_REVIEW_FRACTIONS:
-        caption_start = (
-            "Median fraction of reviews required per species to reach "
-            "dataset-specific agreement thresholds, with the median number of "
-            "reviews in parentheses. Review fractions are computed relative to "
-            "each species' number of reviewable replicates."
-        )
-    else:
-        caption_start = (
-            "Median number of reviews required per species to reach "
-            "dataset-specific agreement thresholds."
-        )
-    speedup_caption = (
-        f" The speedup column reports the {AGREEMENT_THRESHOLD_SPEEDUP_BASELINE_LABEL} "
-        "median review count divided by the "
-        f"{AGREEMENT_THRESHOLD_SPEEDUP_TARGET_LABEL} median review count."
-        if AGREEMENT_THRESHOLD_RENDER_SPEEDUP_COLUMN
-        else ""
-    )
-    caption = (
-        f"\\caption{{\\footnotesize {caption_start} Results of the "
-        "best-performing method(s) are bolded. Thresholds are shown beside each "
-        "metric name and are higher for camera-trap datasets, where lower "
-        "thresholds are frequently reached at zero reviews by continuous-score "
-        f"models.{speedup_caption}}}"
-    )
-    return "\n".join(
-        [
-            "\\begin{table}[t]",
-            "\\centering",
-            "\\small",
-            "\\resizebox{\\textwidth}{!}{",
-            tabular,
-            "}",
-            caption,
-            "\\label{tab:agreement_table}",
-            "\\end{table}",
-        ]
-    )
+    return "\n".join(tabular_lines)
 
 
 def timing_numeric_series(
@@ -4279,31 +4327,7 @@ def computational_cost_iteration_latex(cost_table: pd.DataFrame) -> str:
             if model_index < len(model_groups) - 1:
                 tabular_lines.append(r"\cmidrule(lr){2-7}")
     tabular_lines.extend([r"\bottomrule", r"\end{tabular}"])
-    tabular = "\n".join(tabular_lines)
-    return "\n".join(
-        [
-            r"\begin{table}[t]",
-            r"\centering",
-            r"\small",
-            r"\resizebox{\textwidth}{!}{",
-            tabular,
-            "}",
-            (
-                r"\caption{\footnotesize Mean wall-clock time per active-review "
-                r"iteration, averaged over species-experiment trajectories after "
-                r"excluding terminal iterations with no selected reviews. Model "
-                r"fitting is the occupancy-model MCMC time plus score-mixture "
-                r"calibration for the decoupled continuous-score model. Ranking "
-                r"is the time used to score and order candidate reviews. Total "
-                r"includes recorded per-iteration overhead in addition to these "
-                r"two components. Plus-minus values are 95\% confidence-interval "
-                r"half-widths across species-experiment trajectory means; intervals "
-                r"are omitted for entries below 0.01 s.}"
-            ),
-            r"\label{tab:computational_cost_iteration_times}",
-            r"\end{table}",
-        ]
-    )
+    return "\n".join(tabular_lines)
 
 
 def plot_agreement_curves(
@@ -4440,19 +4464,6 @@ def plot_agreement_curves(
                         experiment_metric["mean_value"],
                         experiment_metric["sem_value"],
                     )
-                trend_mean = centered_rolling_trend(
-                    display_mean,
-                    window=AGREEMENT_TREND_WINDOW,
-                )
-                trend_lower = centered_rolling_trend(
-                    display_lower,
-                    window=AGREEMENT_TREND_WINDOW,
-                )
-                trend_upper = centered_rolling_trend(
-                    display_upper,
-                    window=AGREEMENT_TREND_WINDOW,
-                )
-                trend_upper = np.maximum(trend_upper, trend_lower)
                 color = SELECTION_COLORS.get(
                     experiment_row.selection_method,
                     "#444444",
@@ -4461,31 +4472,21 @@ def plot_agreement_curves(
                     experiment_row.model_family,
                     "-",
                 )
-                if np.isfinite(trend_lower).any() and np.isfinite(trend_upper).any():
+                if np.isfinite(display_lower).any() and np.isfinite(display_upper).any():
                     axis.fill_between(
                         experiment_metric["review_count"],
-                        trend_lower,
-                        trend_upper,
+                        display_lower,
+                        display_upper,
                         color=color,
                         alpha=0.10,
                         linewidth=0.0,
                     )
-                # The faint line is the unsmoothed aggregate; the heavier line
-                # is a visual trend, not a replacement for the raw variability.
                 axis.plot(
                     experiment_metric["review_count"],
                     display_mean,
                     color=color,
                     linestyle=linestyle,
-                    linewidth=AGREEMENT_RAW_TRACE_LINEWIDTH,
-                    alpha=AGREEMENT_RAW_TRACE_ALPHA,
-                )
-                axis.plot(
-                    experiment_metric["review_count"],
-                    trend_mean,
-                    color=color,
-                    linestyle=linestyle,
-                    linewidth=AGREEMENT_TREND_LINEWIDTH,
+                    linewidth=AGREEMENT_CURVE_LINEWIDTH,
                 )
                 # axis.set_yscale("log")
                 # axis.set_xscale("log")
@@ -4499,8 +4500,9 @@ def plot_agreement_curves(
                     )
                 )
             if row_index == len(datasets) - 1:
-                axis.set_xlabel("$t$")
+                axis.set_xlabel("Review budget")
             axis.set_xlim(x_min_log, x_max)
+            axis.tick_params(axis="y", labelsize=7.5, pad=1.0)
 
     visible_selection_methods = ordered_values(
         experiment_meta["selection_method"],
@@ -4539,13 +4541,14 @@ def plot_agreement_curves(
         frameon=False,
     )
     fig.add_artist(policy_legend)
-    fig.legend(
-        handles=family_handles,
-        ncol=max(len(family_handles), 1),
-        loc="lower center",
-        bbox_to_anchor=(0.5, -0.135),
-        frameon=False,
-    )
+    if len(visible_model_families) > 1:
+        fig.legend(
+            handles=family_handles,
+            ncol=max(len(family_handles), 1),
+            loc="lower center",
+            bbox_to_anchor=(0.5, -0.135),
+            frameon=False,
+        )
     apply_tight_layout(
         fig,
         rect=(0.0, 0.14, 1.0, 0.94),
@@ -4555,6 +4558,7 @@ def plot_agreement_curves(
         wspace=0.20,
         hspace=0.24,
     )
+    fig.align_ylabels(axes[:, 0])
     maybe_save_figure(fig, figure_output_dir, filename)
     plt.show(block=False)
     plt.close(fig)
@@ -4637,25 +4641,12 @@ def plot_average_model_family_agreement_curves(
                     family_metric["mean_value"],
                     family_metric["sem_value"],
                 )
-                trend_mean = centered_rolling_trend(
-                    display_mean,
-                    window=AGREEMENT_TREND_WINDOW,
-                )
-                trend_lower = centered_rolling_trend(
-                    display_lower,
-                    window=AGREEMENT_TREND_WINDOW,
-                )
-                trend_upper = centered_rolling_trend(
-                    display_upper,
-                    window=AGREEMENT_TREND_WINDOW,
-                )
-                trend_upper = np.maximum(trend_upper, trend_lower)
                 color = MODEL_FAMILY_COLORS.get(model_family, "#444444")
-                if np.isfinite(trend_lower).any() and np.isfinite(trend_upper).any():
+                if np.isfinite(display_lower).any() and np.isfinite(display_upper).any():
                     axis.fill_between(
                         family_metric["review_count"],
-                        trend_lower,
-                        trend_upper,
+                        display_lower,
+                        display_upper,
                         color=color,
                         alpha=0.10,
                         linewidth=0.0,
@@ -4665,15 +4656,7 @@ def plot_average_model_family_agreement_curves(
                     display_mean,
                     color=color,
                     linestyle=MODEL_FAMILY_LINESTYLES.get(model_family, "-"),
-                    linewidth=AGREEMENT_RAW_TRACE_LINEWIDTH,
-                    alpha=AGREEMENT_RAW_TRACE_ALPHA,
-                )
-                axis.plot(
-                    family_metric["review_count"],
-                    trend_mean,
-                    color=color,
-                    linestyle=MODEL_FAMILY_LINESTYLES.get(model_family, "-"),
-                    linewidth=AGREEMENT_TREND_LINEWIDTH,
+                    linewidth=AGREEMENT_CURVE_LINEWIDTH,
                 )
                 # axis.set_xscale("log")
             if row_index == 0:
@@ -4686,8 +4669,9 @@ def plot_average_model_family_agreement_curves(
                     )
                 )
             if row_index == len(datasets) - 1:
-                axis.set_xlabel("$t$")
+                axis.set_xlabel("Review budget")
             axis.set_xlim(x_min_log, x_max)
+            axis.tick_params(axis="y", labelsize=7.5, pad=1.0)
 
     family_handles = [
         Line2D(
@@ -4719,6 +4703,7 @@ def plot_average_model_family_agreement_curves(
         wspace=0.20,
         hspace=0.24,
     )
+    fig.align_ylabels(axes[:, 0])
     maybe_save_figure(fig, figure_output_dir, filename)
     plt.show(block=False)
     plt.close(fig)
@@ -4748,7 +4733,7 @@ agreement_frame = pd.concat(
     sort=False,
 )
 agreement_aggregate = aggregate_summary_curves(
-    agreement_frame,
+    agreement_budget_curves(agreement_frame),
     metric_columns=[metric_column for metric_column, _ in AGREEMENT_CURVE_METRICS],
 )
 (
@@ -4761,7 +4746,7 @@ null_agreement_frame = pd.concat(
     sort=False,
 )
 null_agreement_aggregate = aggregate_summary_curves(
-    null_agreement_frame,
+    agreement_budget_curves(null_agreement_frame),
     metric_columns=[metric_column for metric_column, _ in AGREEMENT_CURVE_METRICS],
 )
 agreement_aggregates = {
@@ -4796,12 +4781,12 @@ null_family_average_agreement_frame = pd.concat(
 )
 family_average_agreement_aggregates = {
     "full": aggregate_shared_policy_model_family_curves(
-        full_family_average_agreement_frame,
+        agreement_budget_curves(full_family_average_agreement_frame),
         metric_columns=[metric_column for metric_column, _ in AGREEMENT_CURVE_METRICS],
         model_families=AGREEMENT_FAMILY_AVERAGE_MODEL_FAMILIES,
     ),
     "null": aggregate_shared_policy_model_family_curves(
-        null_family_average_agreement_frame,
+        agreement_budget_curves(null_family_average_agreement_frame),
         metric_columns=[metric_column for metric_column, _ in AGREEMENT_CURVE_METRICS],
         model_families=AGREEMENT_FAMILY_AVERAGE_MODEL_FAMILIES,
     ),

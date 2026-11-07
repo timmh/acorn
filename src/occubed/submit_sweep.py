@@ -28,8 +28,9 @@ from occubed.paths import (
     SCRIPT_DIR,
     SWEEP_ROOT,
 )
+from occubed.experiment_config import FINAL_EXPERIMENT_IDS
 
-EXPERIMENT_SCRIPT = SCRIPT_DIR / "run_reviews.py"
+EXPERIMENT_SCRIPT = SCRIPT_DIR / "03_run_reviews.py"
 DEFAULT_SWEEP_ROOT = SWEEP_ROOT
 SUPPORTED_DATASETS = ("acoustic", "iwildcam")
 DEFAULT_DATASETS = ("acoustic", "iwildcam")
@@ -180,7 +181,7 @@ def top_iwildcam_species(top_k=DEFAULT_TOP_SPECIES_COUNT):
     return [str(species_name) for species_name in mapping["category_name"].head(top_k)]
 
 
-def build_job_specs(dataset, species, top_k=DEFAULT_TOP_SPECIES_COUNT):
+def build_job_specs(dataset, species, top_k=DEFAULT_TOP_SPECIES_COUNT, iwildcam_top_k=None):
     datasets = normalize_datasets(dataset)
     species = normalize_species(species)
     if species:
@@ -190,7 +191,12 @@ def build_job_specs(dataset, species, top_k=DEFAULT_TOP_SPECIES_COUNT):
             )
         return [dict(dataset_kind=datasets[0], species_name=name) for name in species]
 
-    defaults = default_species_by_dataset(top_k=top_k, dataset_kinds=datasets)
+    if iwildcam_top_k is None:
+        iwildcam_top_k = min(25, int(top_k))
+    defaults = {
+        kind: top_species_for_dataset(kind, top_k=iwildcam_top_k if kind == "iwildcam" else top_k)
+        for kind in datasets
+    }
     job_specs = []
     for dataset_kind in datasets:
         for species_name in defaults[dataset_kind]:
@@ -488,6 +494,7 @@ def load_existing_sweep_job_specs(sweep_dir):
             dict(
                 dataset_kind=dataset_kind,
                 species_name=species_name,
+                random_seed=int(row.get("random_seed", 0)),
                 output_dir=str(output_dir),
                 submitted_job_id=str(row.get("job_id", "")),
             )
@@ -496,7 +503,8 @@ def load_existing_sweep_job_specs(sweep_dir):
 
 
 def job_spec_key(job_spec):
-    return (str(job_spec["dataset_kind"]), str(job_spec["species_name"]))
+    return (str(job_spec["dataset_kind"]), str(job_spec["species_name"]),
+            int(job_spec.get("random_seed", 0)))
 
 
 def merge_continue_job_specs(sweep_dir, desired_job_specs):
@@ -508,7 +516,7 @@ def merge_continue_job_specs(sweep_dir, desired_job_specs):
     for index, desired_spec in enumerate(desired_job_specs):
         dataset_kind = str(desired_spec["dataset_kind"])
         species_name = str(desired_spec["species_name"])
-        merged_spec = dict(dataset_kind=dataset_kind, species_name=species_name)
+        merged_spec = dict(desired_spec, dataset_kind=dataset_kind, species_name=species_name)
         existing_spec = existing_specs_by_key.get(job_spec_key(merged_spec))
         if existing_spec is None:
             output_dir = (
@@ -541,6 +549,9 @@ class SpeciesExperimentJob(_SUBMITIT_CHECKPOINTABLE):
         random_seed,
         reviews_per_step,
         max_reviews,
+        experiment_ids=FINAL_EXPERIMENT_IDS,
+        include_null=False,
+        compact_selection_diagnostics=True,
     ):
         self.dataset_kind = dataset_kind
         self.species = species
@@ -551,6 +562,9 @@ class SpeciesExperimentJob(_SUBMITIT_CHECKPOINTABLE):
         self.random_seed = int(random_seed)
         self.reviews_per_step = int(reviews_per_step)
         self.max_reviews = int(max_reviews)
+        self.experiment_ids = tuple(experiment_ids)
+        self.include_null = bool(include_null)
+        self.compact_selection_diagnostics = bool(compact_selection_diagnostics)
 
     def command(self):
         return [
@@ -575,6 +589,9 @@ class SpeciesExperimentJob(_SUBMITIT_CHECKPOINTABLE):
             "--max_reviews",
             str(self.max_reviews),
             "--continue=True",
+            "--experiment_ids=" + ",".join(self.experiment_ids),
+            "--include_null=" + str(self.include_null),
+            "--compact_selection_diagnostics=" + str(self.compact_selection_diagnostics),
         ]
 
     def __call__(self):
@@ -603,7 +620,7 @@ class SpeciesExperimentJob(_SUBMITIT_CHECKPOINTABLE):
 
         from occubed.run_reviews import real_data_output_is_complete
 
-        if real_data_output_is_complete(self.output_dir):
+        if real_data_output_is_complete(self.output_dir, self.experiment_ids, self.max_reviews):
             job_wall_time_seconds = time.perf_counter() - job_start_time
             job_metadata.update(
                 status="completed",
@@ -633,6 +650,8 @@ class SpeciesExperimentJob(_SUBMITIT_CHECKPOINTABLE):
             completed = subprocess.run(
                 self.command(),
                 cwd=PACKAGE_DIR,
+                env=dict(os.environ, PYTHONPATH=str(PACKAGE_DIR / "src"),
+                         JAX_ENABLE_X64="false", JAX_PLATFORMS="cpu", OPENBLAS_NUM_THREADS="1"),
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 check=False,
@@ -676,12 +695,17 @@ def main(
     num_warmup=500,
     num_samples=500,
     num_chains=3,
-    random_seed=0,
+    random_seed=None,
     reviews_per_step=DEFAULT_ACOUSTIC_REVIEWS_PER_STEP,
     max_reviews=DEFAULT_ACOUSTIC_MAX_REVIEWS,
     iwildcam_reviews_per_step=DEFAULT_IWILDCAM_REVIEWS_PER_STEP,
     iwildcam_max_reviews=DEFAULT_IWILDCAM_MAX_REVIEWS,
     top_k=DEFAULT_TOP_SPECIES_COUNT,
+    iwildcam_top_k=None,
+    seeds=None,
+    experiment_ids=None,
+    include_null=False,
+    compact_selection_diagnostics=True,
     continue_=False,
 ):
     if submitit is None:
@@ -695,10 +719,32 @@ def main(
     env_file = Path(env_file)
     debug_from_env, executor_parameters = load_submitit_config(env_file)
     debug_mode = bool(debug or debug_from_env)
+    if seeds is None:
+        seeds = (0, 1, 2) if random_seed is None else (random_seed,)
+    if random_seed is None:
+        random_seed = 0
+    if isinstance(seeds, str):
+        seeds = seeds.split(",")
+    seeds = [int(seed) for seed in (seeds if isinstance(seeds, (list, tuple)) else [seeds])]
+    if not seeds or len(set(seeds)) != len(seeds):
+        raise ValueError("Provide distinct inference seeds.")
+    if experiment_ids is None:
+        experiment_ids = FINAL_EXPERIMENT_IDS + (
+            tuple(name + "__null" for name in FINAL_EXPERIMENT_IDS) if include_null else ())
+    if isinstance(experiment_ids, str):
+        experiment_ids = tuple(experiment_ids.split(","))
+    def seeded_specs():
+        cohort = build_job_specs(dataset, species, top_k=int(top_k), iwildcam_top_k=iwildcam_top_k)
+        return [dict(spec, random_seed=seed) for seed in seeds for spec in cohort]
     existing_sweep_manifest = {}
     if continue_:
         sweep_dir = find_most_recent_sweep_dir(output_root)
         existing_sweep_manifest = read_single_csv_row(sweep_dir / "sweep_manifest.csv")
+        seeds = [int(seed) for seed in str(existing_sweep_manifest.get("seeds", random_seed)).split(",")]
+        experiment_ids = tuple(str(existing_sweep_manifest.get("experiment_ids", ",".join(experiment_ids))).split(","))
+        include_null = coerce_bool(existing_sweep_manifest.get("include_null", include_null))
+        compact_selection_diagnostics = coerce_bool(existing_sweep_manifest.get("compact_selection_diagnostics", compact_selection_diagnostics))
+        iwildcam_top_k = int(existing_sweep_manifest.get("iwildcam_top_k", min(25, top_k) if iwildcam_top_k is None else iwildcam_top_k))
         num_warmup = int(
             coerce_env_value(existing_sweep_manifest.get("num_warmup", num_warmup))
         )
@@ -745,14 +791,14 @@ def main(
         )
         top_k = int(coerce_env_value(existing_sweep_manifest.get("top_k", top_k)))
         job_spec_build_start_time = time.perf_counter()
-        desired_job_spec_list = build_job_specs(dataset, species, top_k=int(top_k))
+        desired_job_spec_list = seeded_specs()
         job_spec_list = merge_continue_job_specs(sweep_dir, desired_job_spec_list)
         job_spec_build_wall_time_seconds = (
             time.perf_counter() - job_spec_build_start_time
         )
     else:
         job_spec_build_start_time = time.perf_counter()
-        job_spec_list = build_job_specs(dataset, species, top_k=int(top_k))
+        job_spec_list = seeded_specs()
         job_spec_build_wall_time_seconds = (
             time.perf_counter() - job_spec_build_start_time
         )
@@ -789,6 +835,11 @@ def main(
         num_samples=int(num_samples),
         num_chains=int(num_chains),
         random_seed=int(random_seed),
+        seeds=",".join(map(str, seeds)),
+        experiment_ids=",".join(experiment_ids),
+        include_null=int(include_null),
+        compact_selection_diagnostics=int(compact_selection_diagnostics),
+        iwildcam_top_k=min(25, int(top_k)) if iwildcam_top_k is None else int(iwildcam_top_k),
         reviews_per_step=int(reviews_per_step),
         max_reviews=int(max_reviews),
         acoustic_reviews_per_step=int(reviews_per_step),
@@ -823,6 +874,7 @@ def main(
         spec = dict(
             dataset_kind=dataset_kind,
             species=species_name,
+            random_seed=int(job_spec.get("random_seed", random_seed)),
             output_dir=str(species_dir),
             submitted_job_id=str(job_spec.get("submitted_job_id", "")),
         )
@@ -842,10 +894,17 @@ def main(
             if debug_mode
             else submitit.AutoExecutor(folder=submitit_dir)
         )
+        additional = dict(filtered_parameters.pop("slurm_additional_parameters", {}))
+        filtered_parameters.pop("slurm_array_parallelism", None)
+        additional.update(requeue=True, gpus=0)
+        if not debug_mode and len(ordered_specs) > 1:
+            additional["array"] = f"0-{len(ordered_specs) - 1}"
+        else:
+            additional.pop("array", None)
         executor.update_parameters(
             name=job_name,
             **filtered_parameters,
-            slurm_additional_parameters={"requeue": True, "gpus": 0},
+            slurm_additional_parameters=additional,
         )
         with executor.batch():
             for spec in ordered_specs:
@@ -864,9 +923,12 @@ def main(
                         num_warmup=int(num_warmup),
                         num_samples=int(num_samples),
                         num_chains=int(num_chains),
-                        random_seed=int(random_seed),
+                        random_seed=spec["random_seed"],
                         reviews_per_step=int(spec_reviews_per_step),
                         max_reviews=int(spec_max_reviews),
+                        experiment_ids=experiment_ids,
+                        include_null=include_null,
+                        compact_selection_diagnostics=compact_selection_diagnostics,
                     )
                 )
                 jobs.append(job)
@@ -875,6 +937,7 @@ def main(
             dict(
                 dataset_kind=job_specs[job]["dataset_kind"],
                 species=job_specs[job]["species"],
+                random_seed=job_specs[job]["random_seed"],
                 output_dir=job_specs[job]["output_dir"],
                 job_id=str(job.job_id),
             )

@@ -1,4 +1,5 @@
 import math
+import os
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -15,7 +16,7 @@ GEE_CACHE_DIR = CACHE_ROOT_DIR / "gee_covariates"
 ACOUSTIC_FOREST_SOUNDSCAPE_DIR = DATA_DIR / "acoustic_forest_soundscape"
 IWILDCAM2022_DIR = DATA_DIR / "iwildcam2022"
 GEE_MEMORY = Memory(GEE_CACHE_DIR, verbose=0)
-GEE_PROJECT = "zorrilla"
+GEE_PROJECT = os.environ.get("OCCUBED_GEE_PROJECT", "").strip()
 LOCAL_BUFFER_METERS = 500
 LAND_COVER_YEAR = 2020
 POPULATION_YEAR = 2020
@@ -46,12 +47,16 @@ EARTH_RADIUS_KM = 6371.0
 
 def _initialize_earth_engine(project=GEE_PROJECT):
     try:
-        ee.Initialize(project=project)
+        if project:
+            ee.Initialize(project=project)
+        else:
+            ee.Initialize()
     except Exception as exc:  # pragma: no cover - depends on local credentials
+        project_hint = f" for project `{project}`" if project else ""
         raise RuntimeError(
-            "Google Earth Engine initialization failed for project "
-            f"`{project}`. Ensure `earthengine-api` is installed and the "
-            "local credentials are configured for this project."
+            f"Google Earth Engine initialization failed{project_hint}. "
+            "Ensure `earthengine-api` is installed and Earth Engine credentials "
+            "are configured."
         ) from exc
 
 

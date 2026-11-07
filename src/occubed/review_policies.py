@@ -1,5 +1,6 @@
 import jax.numpy as jnp
 import jax.random as jr
+from jax.scipy.special import xlogy as _xlogy
 import numpy as np
 import numpyro
 import numpyro.distributions as dist
@@ -11,8 +12,16 @@ from occubed.score_calibration import ScoreMixtureCalibration
 
 
 def binary_entropy(prob):
-    prob = jnp.clip(prob, 1e-12, 1.0 - 1e-12)
-    return -(prob * jnp.log(prob) + (1 - prob) * jnp.log1p(-prob))
+    prob = jnp.clip(jnp.asarray(prob, dtype=float), 0.0, 1.0)
+    return -_xlogy(prob, prob) - _xlogy(1 - prob, 1 - prob)
+
+
+def _clip_log_probability(prob):
+    prob = jnp.asarray(prob, dtype=float)
+    # The old upper bound rounded to 1 in float32, making log odds undefined.
+    one = jnp.asarray(1.0, dtype=prob.dtype)
+    upper = jnp.minimum(one - 1e-12, jnp.nextafter(one, jnp.zeros_like(one)))
+    return jnp.clip(prob, 1e-12, upper)
 
 
 DUAL_BALANCED_MAX_SCORE_FRACTION = 13.0 / 25.0
@@ -32,6 +41,27 @@ TARGET_EIG_TARGET_CONFIG = dict(
     max_target_dim=30,
     include_intercepts=True,
 )
+TARGET_EIG_TASK_TARGET_CONFIGS = {
+    "combined": dict(TARGET_EIG_TARGET_CONFIG),
+    "site_occupancy": {
+        **TARGET_EIG_TARGET_CONFIG,
+        "include_psi": True,
+        "include_beta": False,
+        "include_alpha": False,
+    },
+    "occupancy_coefficients": {
+        **TARGET_EIG_TARGET_CONFIG,
+        "include_psi": False,
+        "include_beta": True,
+        "include_alpha": False,
+    },
+    "detection_coefficients": {
+        **TARGET_EIG_TARGET_CONFIG,
+        "include_psi": False,
+        "include_beta": False,
+        "include_alpha": True,
+    },
+}
 TARGET_EIG_ACQUISITION_CONFIG = dict(
     chunk_size=128,
     jitter=1e-6,
@@ -1467,8 +1497,9 @@ def uncalibrated_prob_positive_draws(
     )
     log_n0 = -0.5 * ((score_values[None, ...] - mu0) / sigma0) ** 2 - jnp.log(sigma0)
     log_n1 = -0.5 * ((score_values[None, ...] - mu1) / sigma1) ** 2 - jnp.log(sigma1)
-    log_p = jnp.log(jnp.clip(prob_detection, 1e-12, 1.0 - 1e-12))
-    log_1mp = jnp.log1p(-jnp.clip(prob_detection, 1e-12, 1.0 - 1e-12))
+    clipped_detection = _clip_log_probability(prob_detection)
+    log_p = jnp.log(clipped_detection)
+    log_1mp = jnp.log1p(-clipped_detection)
     log_mix1 = jnp.logaddexp(log_1mp + log_n0, log_p + log_n1)
     log_like1 = jnp.where(
         verified[None, ...],
@@ -1480,9 +1511,8 @@ def uncalibrated_prob_positive_draws(
         jnp.where(verified_value[None, ...] > 0.5, -jnp.inf, log_n0),
         jnp.where(valid_score_observation[None, ...], log_n0, 0.0),
     )
-    logit_psi = jnp.log(jnp.clip(psi, 1e-12, 1.0 - 1e-12)) - jnp.log1p(
-        -jnp.clip(psi, 1e-12, 1.0 - 1e-12)
-    )
+    clipped_psi = _clip_log_probability(psi)
+    logit_psi = jnp.log(clipped_psi) - jnp.log1p(-clipped_psi)
     posterior_z = 1.0 / (
         1.0 + jnp.exp(-(logit_psi + (log_like1 - log_like0).sum(axis=-1)))
     )
@@ -1551,11 +1581,11 @@ def _summarize_calibrated_prob_positive(
     prob_detection = 1.0 / (
         1.0 + jnp.exp(-jnp.einsum("sprc,kc->kspr", design_matrix, alpha))
     )
-    log_p = jnp.log(jnp.clip(prob_detection, 1e-12, 1.0 - 1e-12))
-    log_1mp = jnp.log1p(-jnp.clip(prob_detection, 1e-12, 1.0 - 1e-12))
-    logit_psi = jnp.log(jnp.clip(psi, 1e-12, 1.0 - 1e-12)) - jnp.log1p(
-        -jnp.clip(psi, 1e-12, 1.0 - 1e-12)
-    )
+    clipped_detection = _clip_log_probability(prob_detection)
+    log_p = jnp.log(clipped_detection)
+    log_1mp = jnp.log1p(-clipped_detection)
+    clipped_psi = _clip_log_probability(psi)
+    logit_psi = jnp.log(clipped_psi) - jnp.log1p(-clipped_psi)
     if score_log_bf_draws is None:
         score_log_bf_draws_values = score_log_bf_values[None, ...]
     else:
@@ -1648,10 +1678,10 @@ def calibrated_prob_positive_draws(
     prob_detection = 1.0 / (
         1.0 + jnp.exp(-jnp.einsum("sprc,kc->kspr", design_matrix, alpha))
     )
-    prob_detection = jnp.clip(prob_detection, 1e-12, 1.0 - 1e-12)
+    prob_detection = _clip_log_probability(prob_detection)
     log_p = jnp.log(prob_detection)
     log_1mp = jnp.log1p(-prob_detection)
-    clipped_psi = jnp.clip(psi, 1e-12, 1.0 - 1e-12)
+    clipped_psi = _clip_log_probability(psi)
     logit_psi = jnp.log(clipped_psi) - jnp.log1p(-clipped_psi)
     if score_log_bf_draws is None:
         score_log_bf_draws_values = score_log_bf_values[None, ...]
@@ -2470,8 +2500,9 @@ def reviewed_label_prob_positive_draws(
     prob_detection = 1.0 / (
         1.0 + jnp.exp(-jnp.einsum("sprc,kc->kspr", design_matrix, alpha))
     )
-    log_p = jnp.log(jnp.clip(prob_detection, 1e-12, 1.0 - 1e-12))
-    log_1mp = jnp.log1p(-jnp.clip(prob_detection, 1e-12, 1.0 - 1e-12))
+    clipped_detection = _clip_log_probability(prob_detection)
+    log_p = jnp.log(clipped_detection)
+    log_1mp = jnp.log1p(-clipped_detection)
     log_like1 = jnp.where(
         reviewed[None, ...],
         jnp.where(reviewed_value[None, ...] > 0.5, log_p, log_1mp),
@@ -2482,9 +2513,8 @@ def reviewed_label_prob_positive_draws(
         jnp.where(reviewed_value[None, ...] > 0.5, -jnp.inf, 0.0),
         0.0,
     )
-    logit_psi = jnp.log(jnp.clip(psi, 1e-12, 1.0 - 1e-12)) - jnp.log1p(
-        -jnp.clip(psi, 1e-12, 1.0 - 1e-12)
-    )
+    clipped_psi = _clip_log_probability(psi)
+    logit_psi = jnp.log(clipped_psi) - jnp.log1p(-clipped_psi)
     posterior_z = 1.0 / (
         1.0 + jnp.exp(-(logit_psi + (log_like1 - log_like0).sum(axis=-1)))
     )

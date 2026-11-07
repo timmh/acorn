@@ -86,7 +86,6 @@ DATASET_LABELS = {
     "iwildcam": "Camera trap",
 }
 DATASET_ORDER = ("acoustic", "iwildcam")
-STOPPING_TRADEOFF_WIDTH_FRACTION = 0.375
 EXPECTED_GAIN_PATIENCE = 2
 POSTERIOR_SHIFT_PATIENCE = 2
 
@@ -408,6 +407,8 @@ def normalize_exported_results_frame(results_frame: pd.DataFrame) -> pd.DataFram
         ["species", "run__target_species", "dataset__target_species"],
     )
     frame["species_key"] = frame["dataset_kind"] + "::" + frame["species"]
+    if "seed" not in frame and "run__random_seed" in frame:
+        frame["seed"] = pd.to_numeric(frame["run__random_seed"])
     frame["experiment_id"] = coalesce_text_columns(frame, ["experiment_id"])
     frame["covariate_variant"] = coalesce_text_columns(
         frame,
@@ -451,6 +452,8 @@ def read_stopping_trace_export(
 ) -> pd.DataFrame:
     desired_columns = [
         "row_kind",
+        "seed",
+        "run__random_seed",
         "species_index",
         "dataset_kind",
         "run__dataset_kind",
@@ -784,6 +787,7 @@ def evaluate_single_experiment_stopping_sweeps(
                 {
                     "dataset_kind": first_row["dataset_kind"],
                     "species": first_row["species"],
+                    **({"seed": int(first_row["seed"])} if "seed" in first_row else {}),
                     "experiment_id": first_row["experiment_id"],
                     "criterion": spec.name,
                     "criterion_label": spec.label,
@@ -833,7 +837,7 @@ def evaluate_stopping_sweeps(
     trace_groups = [
         group
         for _, group in subset.groupby(
-            ["species_key", "experiment_id"],
+            ["species_key", "experiment_id"] + (["seed"] if "seed" in subset else []),
             dropna=False,
             sort=True,
         )
@@ -890,6 +894,11 @@ def ci95(std: float, count: int) -> float:
 def summarize_stopping_sweeps(stopping_frame: pd.DataFrame) -> pd.DataFrame:
     if stopping_frame.empty:
         return pd.DataFrame()
+
+    if "seed" in stopping_frame:
+        keys = ["dataset_kind", "species", "experiment_id", "criterion", "criterion_label",
+                "parameter_name", "parameter_label", "parameter_value", "parameter_order"]
+        stopping_frame = stopping_frame.groupby(keys, as_index=False).mean(numeric_only=True)
 
     summary = (
         stopping_frame.groupby(
@@ -1008,19 +1017,19 @@ def plot_stopping_tradeoff_sweeps(
             str(value),
         ),
     )
-    figure_width = FULL_WIDTH_IN * STOPPING_TRADEOFF_WIDTH_FRACTION
-    legend_height = 0.38
+    figure_width = FULL_WIDTH_IN
+    legend_height = 0.70
     fig, axes = plt.subplots(
-        len(datasets),
         1,
+        len(datasets),
         figsize=(
             figure_width,
-            figure_width * len(datasets) * ASPECT_RATIO + legend_height,
+            figure_width / len(datasets) * ASPECT_RATIO + legend_height,
         ),
         # sharey=True,
         squeeze=False,
     )
-    axes = axes[:, 0]
+    axes = axes[0]
 
     for axis, dataset_kind in zip(axes, datasets):
         dataset_frame = summary_frame.loc[summary_frame["dataset_kind"] == dataset_kind]
@@ -1070,9 +1079,8 @@ def plot_stopping_tradeoff_sweeps(
         dataset_label = DATASET_LABELS.get(dataset_kind, dataset_kind.title())
         axis.set_box_aspect(ASPECT_RATIO)
         axis.set_xlabel("$t/t_{\\max}$", labelpad=1.0)
-        axis.set_ylabel(
-            f"{dataset_label} $\\bar{{A}}^{{\\star}} - \\bar{{A}}^{{\\mathrm{{stop}}}}$"
-        )
+        axis.set_title(dataset_label)
+        axis.set_ylabel("$\\bar{A}^{\\star} - \\bar{A}^{\\mathrm{stop}}$")
         axis.set_xlim(-0.02, 1.02)
         axis.margins(x=0.01, y=0.04)
 
@@ -1083,7 +1091,7 @@ def plot_stopping_tradeoff_sweeps(
     ]
     fig.legend(
         handles=legend_handles,
-        ncol=min(2, len(legend_handles)),
+        ncol=max(1, len(legend_handles)),
         loc="lower center",
         bbox_to_anchor=(0.5, 0.005),
         frameon=False,
@@ -1093,11 +1101,10 @@ def plot_stopping_tradeoff_sweeps(
     )
     apply_tight_layout(
         fig,
-        rect=(0.0, 0.08, 1.0, 1.0),
+        rect=(0.0, 0.18, 1.0, 1.0),
         pad=0.01,
-        w_pad=0.02,
+        w_pad=1.2,
         h_pad=0.02,
-        hspace=0.18,
     )
     saved_path = maybe_save_figure(fig, output_dir, filename)
     plt.show(block=False)

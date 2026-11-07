@@ -4,6 +4,7 @@ import re
 import sys
 import time
 from dataclasses import asdict
+from importlib.metadata import version
 from pathlib import Path
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -11,6 +12,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 from operator import attrgetter
 
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import matplotlib
@@ -27,10 +29,12 @@ from occubed.datasets import (
     load_iwildcam2022_speciesnet_dataset,
 )
 from occubed.fit_utils import disable_numpyro_mcmc_caching
+from occubed.experiment_config import FINAL_EXPERIMENT_IDS
 from occubed.models import occu, occu_cs, occu_cs_calibrated, occu_cs_init_strategy
 from occubed.paths import ARTIFACTS_DIR
 from occubed.review_policies import *  # noqa: F403
 from occubed.summaries import write_parameter_summary_npz
+from occubed.selection_characterization import selection_pool_arrays
 
 disable_numpyro_mcmc_caching()
 
@@ -234,6 +238,9 @@ def load_saved_experiment_trace(experiment_dir, _dataset_metadata=None):
     )
     experiment_trace["covariate_variant"] = covariate_variant
     experiment_trace["oracle_variant"] = oracle_variant
+    ecological_target = str(manifest_row.get("ecological_target", "")).strip()
+    if ecological_target:
+        experiment_trace["ecological_target"] = ecological_target
     if str(manifest_row.get("n_site_covariates", "")).strip():
         experiment_trace["n_site_covariates"] = int(
             float(manifest_row["n_site_covariates"])
@@ -347,6 +354,20 @@ def summarize_fit_results(fit_results):
             else float("nan")
         ),
     )
+    chain_samples = fit_results.mcmc.get_samples(group_by_chain=True)
+    latent_samples = {name: values for name, values in chain_samples.items()
+                      if name.startswith(("beta", "alpha"))}
+    if latent_samples:
+        latent_summary = numpyro_summary(latent_samples, group_by_chain=True)
+        latent_rhat = np.concatenate([np.asarray(stats["r_hat"]).reshape(-1)
+                                      for stats in latent_summary.values()])
+        latent_ess = np.concatenate([np.asarray(stats["n_eff"]).reshape(-1)
+                                     for stats in latent_summary.values()])
+        scalar_metrics.update(
+            max_latent_r_hat=float(np.max(latent_rhat)),
+            min_latent_n_eff=float(np.min(latent_ess)),
+            latent_diagnostics_finite=int(np.isfinite(latent_rhat).all() and np.isfinite(latent_ess).all()),
+        )
     try:
         scalar_metrics.update(compute_mcmc_diagnostics(fit_results.mcmc))
     except (AssertionError, ValueError, KeyError):
@@ -435,6 +456,7 @@ def build_fit_artifact(
     extra_scalar_metrics=None,
     posterior_shift_rows=None,
     acquisition_candidate_rows=None,
+    selection_pool=None,
 ):
     summary_rows, diagnostic_scalars, _extra_fields = summarize_fit_results(fit_results)
     reviewed_values = np.asarray(reviewed_values, dtype=float)
@@ -493,6 +515,7 @@ def build_fit_artifact(
             if acquisition_candidate_rows is None
             else list(acquisition_candidate_rows)
         ),
+        selection_pool=selection_pool,
     )
 
 
@@ -672,6 +695,19 @@ def build_oracle_artifact(
     )
 
 
+def validate_review_batch(selected, reviewable, n_reviews, selection_method):
+    selected, reviewable = np.asarray(selected, bool), np.asarray(reviewable, bool)
+    expected = min(int(n_reviews), int(reviewable.sum()))
+    if selection_method.endswith("site_diverse"):
+        expected = min(expected, int(reviewable.reshape(reviewable.shape[0], -1).any(axis=1).sum()))
+    actual = int(selected.sum())
+    if expected <= 0 or actual != expected or np.any(selected & ~reviewable):
+        raise RuntimeError(
+            f"{selection_method} selected {actual}/{expected} requested reviews with "
+            f"{int(reviewable.sum())} candidates remaining; inspect nonfinite acquisition utilities."
+        )
+
+
 def run_cs_experiment(
     selection_method,
     data,
@@ -688,6 +724,7 @@ def run_cs_experiment(
     n_reviews_per_step=DEFAULT_N_REVIEWS_PER_STEP,
     max_reviews=DEFAULT_MAX_REVIEWS,
     artifact_writer=None,
+    compact_selection_diagnostics=False,
 ):
     obs = data["obs"]
     site_covs = data["site_covs"] if site_covs is None else site_covs
@@ -1104,6 +1141,12 @@ def run_cs_experiment(
             & ~jnp.isfinite(verified_f[0])
             & jnp.isfinite(true_params["f"][0])
         )
+        requested_batch = n_reviews
+        if selection_method in {"bald", "bald_site_diverse", "target_eig"} and count_reviewed_positives(verified_f) == 0:
+            seed_count = int(model_kwargs.get("score_calibration_seed_n_reviews", n_reviews_per_step))
+            if seed_count > 0:
+                requested_batch = min(requested_batch, seed_count)
+        validate_review_batch(selected, selection_state["reviewable"], requested_batch, selection_method)
         extra_scalar_metrics = dict(
             **summarize_selection_utility(
                 selection_state["expected_gain_score"],
@@ -1151,20 +1194,23 @@ def run_cs_experiment(
             timing_metrics=step_timing_metrics,
             extra_scalar_metrics=extra_scalar_metrics,
             posterior_shift_rows=posterior_shift_summary["posterior_shift_rows"],
-            acquisition_candidate_rows=build_target_eig_candidate_rows(
+            acquisition_candidate_rows=[] if compact_selection_diagnostics else build_target_eig_candidate_rows(
                 dataset_metadata,
                 target_eig_diagnostics,
                 selection_state,
                 selected=selected,
             ),
+            selection_pool=(selection_pool_arrays(
+                selection_state, target_eig_diagnostics,
+                used_bootstrap=(selection_method in {"target_eig", "bald", "bald_site_diverse"}
+                                and count_reviewed_positives(verified_f) == 0
+                                and int(model_kwargs.get("score_calibration_seed_n_reviews", n_reviews_per_step)) > 0),
+            ) if compact_selection_diagnostics else None),
         )
         if artifact_writer is None:
             step_artifacts.append(step_artifact)
         else:
             artifact_writer.write_step(step_artifact)
-        if not bool(selected.any()):
-            previous_fit_results = cs_results
-            break
         verified_f = verified_f.at[0].set(
             jnp.where(selected, true_params["f"][0], verified_f[0])
         )
@@ -1199,6 +1245,7 @@ def run_reviewed_bernoulli_experiment(
     n_reviews_per_step=DEFAULT_N_REVIEWS_PER_STEP,
     max_reviews=DEFAULT_MAX_REVIEWS,
     artifact_writer=None,
+    compact_selection_diagnostics=False,
 ):
     model_kwargs = {} if model_kwargs is None else dict(model_kwargs)
     mcmc_kwargs = dict(DEFAULT_MCMC_KWARGS if mcmc_kwargs is None else mcmc_kwargs)
@@ -1419,6 +1466,7 @@ def run_reviewed_bernoulli_experiment(
             & ~jnp.isfinite(reviewed_f[0])
             & jnp.isfinite(true_params["f"][0])
         )
+        validate_review_batch(selected, selection_state["reviewable"], n_reviews, selection_method)
         extra_scalar_metrics = dict(
             **summarize_selection_utility(
                 selection_state["expected_gain_score"],
@@ -1461,20 +1509,19 @@ def run_reviewed_bernoulli_experiment(
             timing_metrics=step_timing_metrics,
             extra_scalar_metrics=extra_scalar_metrics,
             posterior_shift_rows=posterior_shift_summary["posterior_shift_rows"],
-            acquisition_candidate_rows=build_target_eig_candidate_rows(
+            acquisition_candidate_rows=[] if compact_selection_diagnostics else build_target_eig_candidate_rows(
                 dataset_metadata,
                 target_eig_diagnostics,
                 selection_state,
                 selected=selected,
             ),
+            selection_pool=(selection_pool_arrays(selection_state, target_eig_diagnostics)
+                            if compact_selection_diagnostics else None),
         )
         if artifact_writer is None:
             step_artifacts.append(step_artifact)
         else:
             artifact_writer.write_step(step_artifact)
-        if not bool(selected.any()):
-            previous_fit_results = bernoulli_results
-            break
         reviewed_f = reviewed_f.at[0].set(
             jnp.where(selected, true_params["f"][0], reviewed_f[0])
         )
@@ -1528,6 +1575,15 @@ experiment_plot_styles = {
     ),
     "cut_normal_calibrated_bald": dict(marker="P", linestyle=":", color="C9"),
     "cut_normal_calibrated_target_eig": dict(marker="*", linestyle="-", color="C9"),
+    "cut_normal_calibrated_target_eig_psi": dict(
+        marker="^", linestyle="-", color="C6"
+    ),
+    "cut_normal_calibrated_target_eig_occupancy_coefficients": dict(
+        marker="v", linestyle="-", color="C7"
+    ),
+    "cut_normal_calibrated_target_eig_detection_coefficients": dict(
+        marker="P", linestyle="-", color="C8"
+    ),
     "original_occu_cs_bald": dict(marker="p", linestyle="-", color="C3"),
     "original_occu_cs_target_eig": dict(marker="*", linestyle="-.", color="C8"),
     "reviewed_random__null": dict(marker="x", linestyle="-", color="C1"),
@@ -1568,6 +1624,15 @@ experiment_plot_styles = {
     "cut_normal_calibrated_bald__null": dict(marker="P", linestyle="-.", color="C7"),
     "cut_normal_calibrated_target_eig__null": dict(
         marker="*", linestyle=":", color="C7"
+    ),
+    "cut_normal_calibrated_target_eig_psi__null": dict(
+        marker="^", linestyle=":", color="C6"
+    ),
+    "cut_normal_calibrated_target_eig_occupancy_coefficients__null": dict(
+        marker="v", linestyle=":", color="C7"
+    ),
+    "cut_normal_calibrated_target_eig_detection_coefficients__null": dict(
+        marker="P", linestyle=":", color="C8"
     ),
     "original_occu_cs_bald__null": dict(marker="p", linestyle="--", color="C3"),
     "original_occu_cs_target_eig__null": dict(marker="*", linestyle=":", color="C8"),
@@ -1632,7 +1697,7 @@ def build_cut_normal_model_kwargs(score_calibration_kwargs=None):
 
 def build_cut_normal_experiment_specs(score_calibration_kwargs=None):
     model_kwargs = build_cut_normal_model_kwargs(score_calibration_kwargs)
-    return [
+    specs = [
         dict(
             experiment_id="cut_normal_calibrated_random",
             display_name="Cut Normal calibrated CS random",
@@ -1675,13 +1740,56 @@ def build_cut_normal_experiment_specs(score_calibration_kwargs=None):
             model_family="cut_normal_calibrated_cs",
             model_label="occu_cs_calibrated (cut Normal)",
             selection_method="target_eig",
+            ecological_target="combined",
             model_fn=occu_cs_calibrated,
             model_kwargs={
                 **model_kwargs,
-                "target_eig_target_config": TARGET_EIG_TARGET_CONFIG,
+                "target_eig_target_config": TARGET_EIG_TASK_TARGET_CONFIGS[
+                    "combined"
+                ],
                 "target_eig_acquisition_config": TARGET_EIG_ACQUISITION_CONFIG,
             },
         ),
+    ]
+    return specs
+
+
+def build_cut_normal_task_experiment_specs(score_calibration_kwargs=None):
+    model_kwargs = build_cut_normal_model_kwargs(score_calibration_kwargs)
+    task_variants = (
+        ("site_occupancy", "psi", "site occupancy"),
+        (
+            "occupancy_coefficients",
+            "occupancy_coefficients",
+            "occupancy coefficients",
+        ),
+        (
+            "detection_coefficients",
+            "detection_coefficients",
+            "detection coefficients",
+        ),
+    )
+    return [
+        dict(
+            experiment_id=f"cut_normal_calibrated_target_eig_{id_suffix}",
+            display_name=(
+                "Cut Normal calibrated CS target EIG "
+                f"({display_target} only)"
+            ),
+            model_family="cut_normal_calibrated_cs",
+            model_label="occu_cs_calibrated (cut Normal)",
+            selection_method="target_eig",
+            ecological_target=ecological_target,
+            model_fn=occu_cs_calibrated,
+            model_kwargs={
+                **model_kwargs,
+                "target_eig_target_config": TARGET_EIG_TASK_TARGET_CONFIGS[
+                    ecological_target
+                ],
+                "target_eig_acquisition_config": TARGET_EIG_ACQUISITION_CONFIG,
+            },
+        )
+        for ecological_target, id_suffix, display_target in task_variants
     ]
 
 
@@ -1852,14 +1960,20 @@ def expected_real_data_experiment_ids():
     return experiment_ids
 
 
-def real_data_output_is_complete(output_dir):
+def real_data_output_is_complete(output_dir, experiment_ids=None, max_reviews=None):
     output_dir = Path(output_dir)
     if not (output_dir / "run_manifest.csv").exists():
         return False
+    manifest = read_single_csv_row(output_dir / "run_manifest.csv")
+    requested = int(manifest["max_reviews"]) if max_reviews is None else int(max_reviews)
+    terminal = min(requested, int(manifest.get("n_labelable", requested)))
     experiments_dir = output_dir / "experiments"
     return all(
         saved_experiment_trace_is_usable(experiments_dir / experiment_id)
-        for experiment_id in expected_real_data_experiment_ids()
+        and int(read_single_csv_row(
+            experiments_dir / experiment_id / "experiment_manifest.csv"
+        ).get("final_review_count", -1)) >= terminal
+        for experiment_id in (normalize_experiment_ids(experiment_ids) or expected_real_data_experiment_ids())
     )
 
 
@@ -1887,10 +2001,27 @@ def build_experiment_specs(
     _true_params,
     experiment_ids=None,
     score_calibration_kwargs=None,
+    include_null=True,
 ):
     spec_build_start_time = time.perf_counter()
+    normalized_experiment_ids = normalize_experiment_ids(experiment_ids)
     covariate_variants = build_covariate_variants(data)
+    if not include_null:
+        covariate_variants = [
+            spec for spec in covariate_variants if spec["covariate_variant"] == "full"
+        ]
     base_experiment_specs = build_base_experiment_specs(score_calibration_kwargs)
+    task_experiment_specs = build_cut_normal_task_experiment_specs(
+        score_calibration_kwargs
+    )
+    requested_base_ids = {
+        experiment_id.removesuffix("__null")
+        for experiment_id in (normalized_experiment_ids or ())
+    }
+    if requested_base_ids & {
+        spec["experiment_id"] for spec in task_experiment_specs
+    }:
+        base_experiment_specs.extend(task_experiment_specs)
     experiment_specs = []
     for covariate_variant in covariate_variants:
         shared_parameter_names, oracle_distance_groups = build_oracle_distance_config(
@@ -1930,7 +2061,6 @@ def build_experiment_specs(
                     ),
                 }
             )
-    normalized_experiment_ids = normalize_experiment_ids(experiment_ids)
     if normalized_experiment_ids is not None:
         spec_by_id = {spec["experiment_id"]: spec for spec in experiment_specs}
         missing_ids = [
@@ -2074,7 +2204,7 @@ def save_dataset_metadata_artifacts(bundle, output_dir):
                 dataset_name=bundle["dataset_name"],
                 target_species=bundle["target_species"],
                 target_label=true_params["target_label"],
-                n_sites=int(np.asarray(data["site_covs"]).shape[1]),
+                n_sites=int(np.asarray(metadata["reviewable_mask"]).shape[0]),
                 n_periods=int(np.asarray(data["obs"]).shape[2]),
                 n_replicates=int(np.asarray(data["obs"]).shape[3]),
                 n_site_covariates=int(np.asarray(data["site_covs"]).shape[-1]),
@@ -2172,6 +2302,8 @@ def save_step_artifact(step_artifact, step_dir):
             step_dir / "acquisition_candidate_diagnostics.csv",
             step_artifact["acquisition_candidate_rows"],
         )
+    if step_artifact.get("selection_pool") is not None:
+        np.savez_compressed(step_dir / "selection_pool.npz", **step_artifact["selection_pool"])
 
 
 def save_experiment_trace_summary(
@@ -2197,6 +2329,8 @@ def save_experiment_trace_summary(
         manifest_row["covariate_variant"] = experiment_trace["covariate_variant"]
     if "oracle_variant" in experiment_trace:
         manifest_row["oracle_variant"] = experiment_trace["oracle_variant"]
+    if "ecological_target" in experiment_trace:
+        manifest_row["ecological_target"] = experiment_trace["ecological_target"]
     if "n_site_covariates" in experiment_trace:
         manifest_row["n_site_covariates"] = int(experiment_trace["n_site_covariates"])
     if "n_obs_covariates" in experiment_trace:
@@ -2309,6 +2443,28 @@ def save_run_manifest(bundle, output_dir, artifact_write_wall_time_seconds):
                 num_samples=int(bundle["mcmc_kwargs"]["num_samples"]),
                 num_chains=int(bundle["mcmc_kwargs"]["num_chains"]),
                 random_seed=int(bundle["mcmc_kwargs"]["random_seed"]),
+                jax_enable_x64=bool(jax.config.jax_enable_x64),
+                jax_version=jax.__version__,
+                numpyro_version=version("numpyro"),
+                numpy_version=np.__version__,
+                code_root=str(Path(__file__).resolve().parents[2]),
+                python_executable=sys.executable,
+                score_calibration_prevalence_mean=float(
+                    bundle.get("score_calibration_kwargs", {}).get(
+                        "score_calibration_prevalence_mean",
+                        DEFAULT_CUT_NORMAL_SCORE_CALIBRATION_KWARGS[
+                            "score_calibration_prevalence_mean"
+                        ],
+                    )
+                ),
+                score_calibration_prevalence_strength=float(
+                    bundle.get("score_calibration_kwargs", {}).get(
+                        "score_calibration_prevalence_strength",
+                        DEFAULT_CUT_NORMAL_SCORE_CALIBRATION_KWARGS[
+                            "score_calibration_prevalence_strength"
+                        ],
+                    )
+                ),
                 score_calibration_num_warmup=int(
                     bundle.get("score_calibration_kwargs", {}).get(
                         "score_calibration_num_warmup",
@@ -2343,6 +2499,10 @@ def save_run_manifest(bundle, output_dir, artifact_write_wall_time_seconds):
                 ),
                 n_reviews_per_step=int(bundle["n_reviews_per_step"]),
                 max_reviews=int(bundle["max_reviews"]),
+                requested_max_reviews=int(bundle.get("requested_max_reviews", bundle["max_reviews"])),
+                n_labelable=int(bundle.get("n_labelable", np.isfinite(bundle["true_params"]["f"]).sum())),
+                compact_selection_diagnostics=bool(bundle.get("compact_selection_diagnostics", False)),
+                review_protocol=bundle.get("review_protocol", "full_replicate"),
                 artifact_write_wall_time_seconds=float(
                     artifact_write_wall_time_seconds
                 ),
@@ -2362,6 +2522,12 @@ def run_real_data_experiment(
     max_reviews=DEFAULT_MAX_REVIEWS,
     continue_existing=False,
     experiment_ids=None,
+    include_null=True,
+    compact_selection_diagnostics=False,
+    dataset_bundle=None,
+    oracle_bundles=None,
+    review_labels=None,
+    review_protocol="full_replicate",
 ):
     output_dir = None if output_dir is None else Path(output_dir)
     if output_dir is not None:
@@ -2369,13 +2535,31 @@ def run_real_data_experiment(
     dataset_start_time = time.perf_counter()
     mcmc_kwargs = dict(DEFAULT_MCMC_KWARGS if mcmc_kwargs is None else mcmc_kwargs)
     dataset_load_start_time = time.perf_counter()
-    data, true_params = load_real_data_dataset(dataset_kind, target_species)
+    data, true_params = (load_real_data_dataset(dataset_kind, target_species)
+                         if dataset_bundle is None else dataset_bundle)
+    review_params = true_params
+    if review_labels is not None:
+        labels = np.asarray(review_labels, dtype=float)
+        truth = np.asarray(true_params["f"], dtype=float)
+        if (labels.shape != truth.shape or not np.array_equal(np.isfinite(labels), np.isfinite(truth))
+                or not np.isin(labels[np.isfinite(labels)], [0, 1]).all()
+                or np.any(labels > truth)):
+            raise ValueError("Subset review labels must be binary, share full-label support, and introduce no positives.")
+        review_params = dict(true_params, f=labels)
     dataset_load_wall_time_seconds = time.perf_counter() - dataset_load_start_time
     dataset_metadata = build_real_data_dataset_metadata(data, true_params)
-    oracle_variants = {
-        spec["covariate_variant"]: spec for spec in build_covariate_variants(data)
-    }
-    oracle_bundles = {
+    requested_max_reviews = int(max_reviews)
+    n_labelable = int((dataset_metadata["reviewable_mask"] & np.isfinite(np.asarray(true_params["f"])[0])).sum())
+    max_reviews = min(requested_max_reviews, n_labelable)
+    oracle_variant_specs = build_covariate_variants(data)
+    if not include_null:
+        oracle_variant_specs = [
+            spec
+            for spec in oracle_variant_specs
+            if spec["covariate_variant"] == "full"
+        ]
+    oracle_variants = {spec["covariate_variant"]: spec for spec in oracle_variant_specs}
+    oracle_bundles = oracle_bundles if oracle_bundles is not None else {
         covariate_variant: fit_oracle_variant(
             dataset_kind,
             target_species,
@@ -2388,17 +2572,20 @@ def run_real_data_experiment(
         for covariate_variant, covariate_spec in oracle_variants.items()
     }
     oracle_bundle = oracle_bundles["full"]
-    null_oracle_bundle = oracle_bundles["null"]
+    null_oracle_bundle = oracle_bundles.get("null")
     oracle_parameter_names = oracle_bundle["shared_parameter_names"]
     oracle_distance_groups = oracle_bundle["oracle_distance_groups"]
     oracle_artifact = oracle_bundle["artifact"]
-    null_oracle_artifact = null_oracle_bundle["artifact"]
+    null_oracle_artifact = (
+        None if null_oracle_bundle is None else null_oracle_bundle["artifact"]
+    )
 
     experiment_specs, experiment_spec_timing_metrics = build_experiment_specs(
         data,
         true_params,
         experiment_ids=experiment_ids,
         score_calibration_kwargs=score_calibration_kwargs,
+        include_null=include_null,
     )
     experiment_traces = {}
     experiments_start_time = time.perf_counter()
@@ -2412,7 +2599,7 @@ def run_real_data_experiment(
                 experiment_dir,
                 dataset_metadata,
             )
-            if saved_trace is not None:
+            if saved_trace is not None and len(saved_trace["review_counts"]) and int(saved_trace["review_counts"][-1]) >= max_reviews:
                 experiment_traces[experiment_id] = saved_trace
                 continue
         artifact_writer = None
@@ -2423,7 +2610,7 @@ def run_real_data_experiment(
             experiment_trace = run_reviewed_bernoulli_experiment(
                 experiment_spec["selection_method"],
                 data,
-                true_params,
+                review_params,
                 dataset_metadata,
                 experiment_spec["site_covs"],
                 experiment_spec["obs_covs"],
@@ -2435,12 +2622,13 @@ def run_real_data_experiment(
                 n_reviews_per_step=n_reviews_per_step,
                 max_reviews=max_reviews,
                 artifact_writer=artifact_writer,
+                compact_selection_diagnostics=compact_selection_diagnostics,
             )
         else:
             experiment_trace = run_cs_experiment(
                 experiment_spec["selection_method"],
                 data,
-                true_params,
+                review_params,
                 dataset_metadata,
                 site_covs=experiment_spec["site_covs"],
                 obs_covs=experiment_spec["obs_covs"],
@@ -2453,6 +2641,7 @@ def run_real_data_experiment(
                 n_reviews_per_step=n_reviews_per_step,
                 max_reviews=max_reviews,
                 artifact_writer=artifact_writer,
+                compact_selection_diagnostics=compact_selection_diagnostics,
             )
         experiment_traces[experiment_id] = dict(
             experiment_id=experiment_id,
@@ -2462,6 +2651,7 @@ def run_real_data_experiment(
             selection_method=experiment_spec["selection_method"],
             covariate_variant=experiment_spec["covariate_variant"],
             oracle_variant=experiment_spec["oracle_variant"],
+            ecological_target=experiment_spec.get("ecological_target", ""),
             n_site_covariates=experiment_spec["n_site_covariates"],
             n_obs_covariates=experiment_spec["n_obs_covariates"],
             **experiment_trace,
@@ -2483,7 +2673,7 @@ def run_real_data_experiment(
             time.perf_counter() - dataset_start_time
         ),
         **oracle_bundle["timing_metrics"],
-        **null_oracle_bundle["timing_metrics"],
+        **({} if null_oracle_bundle is None else null_oracle_bundle["timing_metrics"]),
         **experiment_spec_timing_metrics,
     )
     bundle = dict(
@@ -2497,8 +2687,16 @@ def run_real_data_experiment(
         null_oracle_artifact=null_oracle_artifact,
         dataset_results=dataset_results,
         shared_parameter_names=oracle_parameter_names,
-        null_shared_parameter_names=null_oracle_bundle["shared_parameter_names"],
+        null_shared_parameter_names=(
+            []
+            if null_oracle_bundle is None
+            else null_oracle_bundle["shared_parameter_names"]
+        ),
         mcmc_kwargs=mcmc_kwargs,
+        requested_max_reviews=requested_max_reviews,
+        n_labelable=n_labelable,
+        compact_selection_diagnostics=compact_selection_diagnostics,
+        review_protocol=review_protocol,
         score_calibration_kwargs=score_calibration_kwargs or {},
         n_reviews_per_step=n_reviews_per_step,
         max_reviews=max_reviews,
@@ -2507,6 +2705,8 @@ def run_real_data_experiment(
     if output_dir is not None:
         artifact_write_start_time = time.perf_counter()
         save_dataset_metadata_artifacts(bundle, output_dir)
+        if review_labels is not None:
+            write_array(output_dir / "inputs/review_labels.npy", review_labels)
         save_oracle_artifacts(bundle, output_dir)
         plot_results(
             [bundle["dataset_results"]],
@@ -2519,6 +2719,10 @@ def run_real_data_experiment(
                 time.perf_counter() - artifact_write_start_time
             ),
         )
+        if compact_selection_diagnostics:
+            from occubed.characterization import export_species
+
+            export_species(output_dir, tuple(experiment_traces))
     return bundle
 
 
@@ -2529,6 +2733,8 @@ def run_default_experiment_suite(
     n_reviews_per_step=DEFAULT_N_REVIEWS_PER_STEP,
     max_reviews=DEFAULT_MAX_REVIEWS,
     experiment_ids=None,
+    include_null=True,
+    compact_selection_diagnostics=False,
 ):
     output_dir = ARTIFACTS_DIR / "real_data" if output_dir is None else Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2547,6 +2753,8 @@ def run_default_experiment_suite(
             n_reviews_per_step=n_reviews_per_step,
             max_reviews=max_reviews,
             experiment_ids=experiment_ids,
+            include_null=include_null,
+            compact_selection_diagnostics=compact_selection_diagnostics,
         )
         bundles.append(bundle)
         results_by_dataset.append(bundle["dataset_results"])
@@ -2585,7 +2793,12 @@ def main(
     max_reviews=DEFAULT_MAX_REVIEWS,
     continue_=False,
     experiment_ids=None,
+    include_null=False,
+    compact_selection_diagnostics=True,
 ):
+    if experiment_ids is None:
+        experiment_ids = FINAL_EXPERIMENT_IDS + (
+            tuple(name + "__null" for name in FINAL_EXPERIMENT_IDS) if include_null else ())
     if output_dir is not None:
         output_dir = Path(output_dir)
     mcmc_kwargs = dict(
@@ -2614,6 +2827,8 @@ def main(
             n_reviews_per_step=int(reviews_per_step),
             max_reviews=int(max_reviews),
             experiment_ids=experiment_ids,
+            include_null=bool(include_null),
+            compact_selection_diagnostics=bool(compact_selection_diagnostics),
         )
         return
 
@@ -2627,6 +2842,8 @@ def main(
         max_reviews=int(max_reviews),
         continue_existing=bool(continue_),
         experiment_ids=experiment_ids,
+        include_null=bool(include_null),
+        compact_selection_diagnostics=bool(compact_selection_diagnostics),
     )
 
 

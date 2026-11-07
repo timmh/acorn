@@ -65,7 +65,6 @@ REQUIRED_COMPLETION_FILES = (
     "run_manifest.csv",
     "dataset_metadata/scalars.csv",
     "oracle/scalar_metrics.csv",
-    "null_oracle/scalar_metrics.csv",
 )
 
 
@@ -387,9 +386,24 @@ def missing_completion_artifacts(species_dir):
         for relative_file in REQUIRED_COMPLETION_FILES
         if not (species_dir / relative_file).exists()
     ]
-    for relative_dir in ("oracle", "null_oracle"):
+    oracle_dirs = ["oracle"]
+    if any((species_dir / "experiments").glob("*__null")):
+        oracle_dirs.append("null_oracle")
+        if not (species_dir / "null_oracle/scalar_metrics.csv").exists():
+            missing.append("null_oracle/scalar_metrics.csv")
+    for relative_dir in oracle_dirs:
         if not parameter_summary_exists(species_dir / relative_dir):
             missing.append(f"{relative_dir}/parameter_summary.npz or .csv")
+    run = read_single_csv_row(species_dir / "run_manifest.csv")
+    if "n_labelable" in run:
+        terminal = min(int(run["max_reviews"]), int(run["n_labelable"]))
+        experiments = list((species_dir / "experiments").iterdir()) if (species_dir / "experiments").exists() else []
+        if len(experiments) < int(run.get("num_experiments", 0)):
+            missing.append("requested experiment directories")
+        for experiment in experiments:
+            manifest = read_single_csv_row(experiment / "experiment_manifest.csv")
+            if int(manifest.get("final_review_count", -1)) < terminal:
+                missing.append(f"{experiment.name}: complete review trajectory")
     return missing
 
 
@@ -589,6 +603,7 @@ def build_base_row(
 
     row = dict(
         row_kind="species",
+        seed=int(run_manifest.get("random_seed", 0)),
         sweep_name=Path(sweep_dir).name,
         species_index=species_index,
         dataset_kind=str(
@@ -613,6 +628,8 @@ def build_base_row(
     row.update(with_prefix(oracle_metrics, "oracle__"))
     row.update(oracle_parameter_summary)
     row.update(null_oracle_parameter_summary)
+    row["oracle__psi_mean_values"] = format_numeric_vector(
+        load_parameter_mean_array(species_dir / "oracle" / "parameter_summary.npz", "psi"))
     return row, species_dir
 
 
@@ -821,6 +838,8 @@ def main(
     output_root=DEFAULT_SWEEP_ROOT,
     workers=None,
     show_progress=None,
+    characterize=True,
+    require_complete=True,
 ):
     sweep_dir = (
         find_most_recent_sweep_dir(output_root)
@@ -832,10 +851,21 @@ def main(
         if output_path is not None
         else Path(sweep_dir) / DEFAULT_OUTPUT_NAME
     )
+    if require_complete:
+        for index, row in enumerate(read_csv_rows(Path(sweep_dir) / "submitted_jobs.csv")):
+            root = resolve_species_dir(sweep_dir, index, row)
+            if missing := missing_completion_artifacts(root):
+                raise ValueError(f"Incomplete worker {root}: {', '.join(missing)}")
     rows = collect_export_rows_parallel(
         sweep_dir,
         workers=recommended_worker_count() if workers is None else workers,
         show_progress=show_progress,
     )
     write_csv_rows(output_path, rows)
+    if characterize:
+        species_dirs = species_artifact_dirs(sweep_dir)
+        if species_dirs and all((root / "characterization/task_auc.csv").exists() for root in species_dirs):
+            from occubed.characterization import summarize_sweep
+
+            summarize_sweep(species_dirs, Path(sweep_dir) / "characterization")
     return output_path

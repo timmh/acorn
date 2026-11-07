@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+.env
+artifacts/
+figures/
+.ipynb_checkpoints/
+*.egg-info/
+example/data/
+example/predictions.json
+example/predictions.download
+example/target_species.txt
+example/.camera_trap_download_complete
+example/acorn_review_history.csv

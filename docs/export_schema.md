@@ -6,6 +6,7 @@ This file documents the meanings of the CSV files exported by `export_sweep.py`.
 
 - `sweep_name`: Sweep directory name (includes date and time).
 - `species_index`: Zero-based species order in the sweep.
+- `seed`: Inference/calibration seed.
 - `dataset_kind`: Dataset source for the row.
 - `species`: Target species name.
 - `target_label`: Short target label used in the data.
@@ -50,6 +51,10 @@ This file documents the meanings of the CSV files exported by `export_sweep.py`.
 - `run__random_seed`: Species-run random seed.
 - `run__n_reviews_per_step`: Labels reviewed per active-learning step.
 - `run__max_reviews`: Maximum labels reviewed for the species.
+- `run__requested_max_reviews`: Requested cap before truncation at the available labels.
+- `run__n_labelable`: Number of reviewable replicates with a finite reference label.
+- `run__jax_enable_x64`: Recorded JAX precision.
+- `run__review_protocol`: `full_replicate` normally, top-example protocol in the sensitivity experiment. In the latter, original oracle labels remain in `inputs/true_labels.npy`, and actual review responses are saved separately in `inputs/review_labels.npy`.
 - `run__artifact_write_wall_time_seconds`: Time spent writing final species artifacts.
 - `run__dataset_load_wall_time_seconds`: Time spent loading the dataset.
 - `run__oracle_mcmc_wall_time_seconds`: Time spent fitting the oracle model.
@@ -161,7 +166,7 @@ This file documents the meanings of the CSV files exported by `export_sweep.py`.
 
 ### Agreement Inputs
 
-- `oracle__psi_mean_values`: Species-row only. `|`-separated oracle site-level posterior mean occupancy values.
+- `oracle__psi_mean_values`: `|`-separated oracle site-level posterior mean occupancy values, repeated on step rows to retain each seed's oracle in downstream analyses.
 - `trace__psi_mean_values`: Full-model step-row only. `|`-separated step-level site posterior mean occupancy values.
 - Coefficient agreement should be computed downstream from the exported raw interval summaries: `oracle__parameter_q05__cov_state_*`, `oracle__parameter_q95__cov_state_*`, `oracle__parameter_q05__cov_det_*`, `oracle__parameter_q95__cov_det_*`, and matching `parameter_q05__*` / `parameter_q95__*` step columns.
 
